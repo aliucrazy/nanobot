@@ -17,8 +17,18 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.claude import ClaudeTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.firecrawl import (
+    FirecrawlScrapeTool,
+    FirecrawlSearchTool,
+    FirecrawlMapTool,
+    FirecrawlExtractTool,
+)
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.reflection import ReflectionEngine
+from nanobot.agent.user_profiler import UserProfiler
+from nanobot.agent.skill_analytics import SkillAnalytics
 from nanobot.session.manager import SessionManager
 
 
@@ -62,6 +72,8 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self.reflection = ReflectionEngine(workspace, provider, self.model)
+        self.profiler = UserProfiler(workspace)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -106,7 +118,16 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
-    
+
+        # Claude tool (for AI assistance)
+        self.tools.register(ClaudeTool())
+
+        # Firecrawl tools (web scraping, search, extraction)
+        self.tools.register(FirecrawlScrapeTool())
+        self.tools.register(FirecrawlSearchTool())
+        self.tools.register(FirecrawlMapTool())
+        self.tools.register(FirecrawlExtractTool())
+
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
@@ -158,7 +179,15 @@ class AgentLoop:
         
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
-        
+
+        # Extract and update user profile
+        profile = self.profiler.extract_profile(msg)
+        self.profiler.update_profile(profile, msg)
+
+        # Get adaptation hints for context
+        adaptation_hints = self.profiler.get_adaptation_hints(msg.sender_id, msg.channel)
+        logger.debug(f"User profile hints: {adaptation_hints}")
+
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
         
@@ -241,13 +270,36 @@ class AgentLoop:
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
-        
+
+        # Trigger post-conversation reflection (non-blocking)
+        asyncio.create_task(
+            self._trigger_reflection(session.messages, msg.session_key)
+        )
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
             metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
         )
+
+    async def _trigger_reflection(
+        self,
+        messages: list[dict[str, Any]],
+        session_key: str,
+    ) -> None:
+        """
+        Trigger reflection after conversation (fire-and-forget).
+
+        Args:
+            messages: The conversation messages.
+            session_key: Session identifier.
+        """
+        try:
+            await self.reflection.reflect_after_conversation(messages, session_key)
+        except Exception as e:
+            # Reflection failures should not affect the main flow
+            logger.debug(f"Reflection error (non-critical): {e}")
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
