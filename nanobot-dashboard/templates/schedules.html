@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+
+{% block title %}调度任务 - Nanobot Dashboard{% endblock %}
+{% block header %}调度任务{% endblock %}
+
+{% block content %}
+<div class="schedules-page" x-data="schedulesManager()" x-init="loadSchedules()">
+    <!-- Timeline View -->
+    <div class="section">
+        <h2 class="section-title">执行时间线</h2>
+
+        <div class="timeline" x-show="!loading && schedules.length > 0">
+            <template x-for="(schedule, index) in schedules" :key="schedule.id">
+                <div class="timeline-item" :class="{disabled: !schedule.enabled}">
+                    <div class="timeline-marker" :class="schedule.last_status"></div>
+                    <div class="timeline-content">
+                        <div class="timeline-header">
+                            <h4 x-text="schedule.name"></h4>
+                            <div class="timeline-badges">
+                                <span class="badge" :class="schedule.enabled ? 'badge-success' : 'badge-secondary'" x-text="schedule.enabled ? '已启用' : '已禁用'"></span>
+                                <span class="badge badge-info" x-text="schedule.schedule_kind"></span>
+                            </div>
+                        </div>
+                        <div class="timeline-schedule" x-text="schedule.schedule"></div>
+                        <div class="timeline-times">
+                            <div class="time-item">
+                                <span class="time-label">下次执行:</span>
+                                <span class="time-value" x-text="schedule.next_run"></span>
+                            </div>
+                            <div class="time-item" x-show="schedule.last_run">
+                                <span class="time-label">上次执行:</span>
+                                <span class="time-value" x-text="schedule.last_run"></span>
+                                <span class="status-dot" :class="schedule.last_status"></span>
+                            </div>
+                        </div>
+                        <div class="timeline-actions">
+                            <button class="btn btn-sm" :class="schedule.enabled ? 'btn-secondary' : 'btn-primary'" @click="toggleSchedule(schedule)">
+                                <span x-text="schedule.enabled ? '禁用' : '启用'"></span>
+                            </button>
+                            <button class="btn btn-sm btn-primary" @click="runSchedule(schedule)" :disabled="!schedule.enabled">
+                                立即执行
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </template>
+        </div>
+
+        <!-- Loading State -->
+        <div class="loading-state" x-show="loading">
+            <div class="spinner"></div>
+            <p>加载调度任务...</p>
+        </div>
+
+        <!-- Empty State -->
+        <div class="empty-state-full" x-show="!loading && schedules.length === 0">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <path d="M12 6v6l4 2"/>
+            </svg>
+            <p>暂无调度任务</p>
+        </div>
+    </div>
+
+    <!-- Schedule Stats -->
+    <div class="section" x-show="!loading && schedules.length > 0">
+        <h2 class="section-title">统计信息</h2>
+        <div class="stats-row">
+            <div class="stat-item">
+                <span class="stat-number" x-text="schedules.length"></span>
+                <span class="stat-label">总任务数</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-number" x-text="enabledCount"></span>
+                <span class="stat-label">已启用</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-number" x-text="successCount"></span>
+                <span class="stat-label">上次成功</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-number" x-text="errorCount"></span>
+                <span class="stat-label">上次失败</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast" x-show="toast.show" x-transition @click="toast.show = false">
+        <span :class="toast.type" x-text="toast.message"></span>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function schedulesManager() {
+    return {
+        schedules: [],
+        loading: true,
+        toast: {
+            show: false,
+            message: '',
+            type: 'success'
+        },
+
+        get enabledCount() {
+            return this.schedules.filter(s => s.enabled).length;
+        },
+
+        get successCount() {
+            return this.schedules.filter(s => s.last_status === 'ok').length;
+        },
+
+        get errorCount() {
+            return this.schedules.filter(s => s.last_status === 'error').length;
+        },
+
+        async loadSchedules() {
+            this.loading = true;
+            try {
+                const response = await fetch('/api/schedules');
+                const data = await response.json();
+                this.schedules = data.schedules;
+            } catch (error) {
+                this.showToast('加载调度任务失败', 'error');
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        async toggleSchedule(schedule) {
+            try {
+                const response = await fetch(`/api/schedules/${schedule.id}/toggle`, {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    schedule.enabled = data.enabled;
+                    this.showToast(`调度任务已${data.enabled ? '启用' : '禁用'}`, 'success');
+                } else {
+                    throw new Error('Toggle failed');
+                }
+            } catch (error) {
+                this.showToast('操作失败', 'error');
+            }
+        },
+
+        async runSchedule(schedule) {
+            try {
+                const response = await fetch(`/api/schedules/${schedule.id}/run`, {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.triggered) {
+                        this.showToast('调度任务已触发', 'success');
+                    }
+                } else {
+                    throw new Error('Run failed');
+                }
+            } catch (error) {
+                this.showToast('触发失败', 'error');
+            }
+        },
+
+        showToast(message, type = 'success') {
+            this.toast.message = message;
+            this.toast.type = type;
+            this.toast.show = true;
+            setTimeout(() => {
+                this.toast.show = false;
+            }, 3000);
+        }
+    }
+}
+</script>
+{% endblock %}

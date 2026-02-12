@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+
+{% block title %}实时日志 - Nanobot Dashboard{% endblock %}
+{% block header %}实时日志{% endblock %}
+
+{% block content %}
+<div class="logs-page" x-data="logsManager()" x-init="init()">
+    <!-- Filter Bar -->
+    <div class="filter-bar">
+        <div class="filter-group">
+            <label>会话:</label>
+            <select x-model="selectedSession" @change="loadLogs()">
+                <option value="">全部会话</option>
+                <template x-for="session in sessions" :key="session.name">
+                    <option :value="session.name" x-text="session.name + ' (' + formatSize(session.size) + ')'"></option>
+                </template>
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>级别:</label>
+            <select x-model="selectedLevel" @change="loadLogs()">
+                <option value="">全部</option>
+                <option value="INFO">INFO</option>
+                <option value="WARNING">WARNING</option>
+                <option value="ERROR">ERROR</option>
+            </select>
+        </div>
+        <div class="search-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"/>
+                <path d="m21 21-4.35-4.35"/>
+            </svg>
+            <input type="text" x-model="searchTerm" placeholder="搜索日志..." @input="debouncedSearch()">
+        </div>
+        <div class="filter-actions">
+            <button class="btn btn-sm" :class="autoRefresh ? 'btn-primary' : 'btn-secondary'" @click="toggleAutoRefresh()">
+                <span x-text="autoRefresh ? '自动刷新: 开' : '自动刷新: 关'"></span>
+            </button>
+            <button class="btn btn-sm btn-secondary" @click="clearLogs()">
+                清空
+            </button>
+        </div>
+    </div>
+
+    <!-- Logs Container -->
+    <div class="logs-container" x-ref="logsContainer" @scroll="handleScroll()">
+        <div class="logs-content" x-show="logs.length > 0">
+            <template x-for="(log, index) in logs" :key="index">
+                <div class="log-entry" :class="'level-' + log.level.toLowerCase()">
+                    <div class="log-header">
+                        <span class="log-timestamp" x-text="formatTime(log.timestamp)"></span>
+                        <span class="log-session" x-text="log.session"></span>
+                        <span class="log-level" :class="'badge-' + log.level.toLowerCase()" x-text="log.level"></span>
+                        <span class="log-role" x-text="log.role"></span>
+                    </div>
+                    <div class="log-message" x-text="log.content"></div>
+                </div>
+            </template>
+        </div>
+
+        <!-- Loading State -->
+        <div class="loading-state" x-show="loading">
+            <div class="spinner"></div>
+            <p>加载日志...</p>
+        </div>
+
+        <!-- Empty State -->
+        <div class="empty-state-full" x-show="!loading && logs.length === 0">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+            </svg>
+            <p>暂无日志</p>
+        </div>
+
+        <!-- New Logs Indicator -->
+        <div class="new-logs-indicator" x-show="hasNewLogs" @click="scrollToBottom()">
+            有新日志 - 点击滚动到底部
+        </div>
+    </div>
+
+    <!-- Stats Bar -->
+    <div class="logs-stats" x-show="logs.length > 0">
+        <span>显示 <span x-text="logs.length"></span> 条日志</span>
+        <span x-show="infoCount > 0">INFO: <span x-text="infoCount"></span></span>
+        <span x-show="warningCount > 0" class="text-warning">WARNING: <span x-text="warningCount"></span></span>
+        <span x-show="errorCount > 0" class="text-error">ERROR: <span x-text="errorCount"></span></span>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function logsManager() {
+    return {
+        logs: [],
+        sessions: [],
+        loading: true,
+        selectedSession: '',
+        selectedLevel: '',
+        searchTerm: '',
+        autoRefresh: true,
+        hasNewLogs: false,
+        isAtBottom: true,
+        eventSource: null,
+        searchTimeout: null,
+
+        get infoCount() {
+            return this.logs.filter(l => l.level === 'INFO').length;
+        },
+
+        get warningCount() {
+            return this.logs.filter(l => l.level === 'WARNING').length;
+        },
+
+        get errorCount() {
+            return this.logs.filter(l => l.level === 'ERROR').length;
+        },
+
+        async init() {
+            await this.loadSessions();
+            await this.loadLogs();
+            this.startEventSource();
+        },
+
+        async loadSessions() {
+            try {
+                const response = await fetch('/api/logs/sessions');
+                const data = await response.json();
+                this.sessions = data.sessions;
+            } catch (error) {
+                console.error('Failed to load sessions:', error);
+            }
+        },
+
+        async loadLogs() {
+            this.loading = true;
+            try {
+                const params = new URLSearchParams();
+                if (this.selectedSession) params.append('session', this.selectedSession);
+                if (this.selectedLevel) params.append('level', this.selectedLevel);
+                if (this.searchTerm) params.append('search', this.searchTerm);
+                params.append('limit', '100');
+
+                const response = await fetch(`/api/logs?${params}`);
+                const data = await response.json();
+                this.logs = data.logs.reverse(); // Show oldest first
+            } catch (error) {
+                console.error('Failed to load logs:', error);
+            } finally {
+                this.loading = false;
+                this.$nextTick(() => {
+                    this.scrollToBottom();
+                });
+            }
+        },
+
+        startEventSource() {
+            if (this.eventSource) {
+                this.eventSource.close();
+            }
+
+            this.eventSource = new EventSource('/api/logs/stream');
+
+            this.eventSource.onmessage = (event) => {
+                const log = JSON.parse(event.data);
+
+                // Apply filters
+                if (this.selectedSession && log.session !== this.selectedSession) return;
+                if (this.selectedLevel && log.level !== this.selectedLevel) return;
+                if (this.searchTerm && !log.content.toLowerCase().includes(this.searchTerm.toLowerCase())) return;
+
+                this.logs.push(log);
+
+                // Limit to 500 entries
+                if (this.logs.length > 500) {
+                    this.logs.shift();
+                }
+
+                if (this.isAtBottom) {
+                    this.$nextTick(() => {
+                        this.scrollToBottom();
+                    });
+                } else {
+                    this.hasNewLogs = true;
+                }
+            };
+
+            this.eventSource.onerror = () => {
+                console.log('EventSource connection lost, retrying...');
+                setTimeout(() => this.startEventSource(), 5000);
+            };
+        },
+
+        toggleAutoRefresh() {
+            this.autoRefresh = !this.autoRefresh;
+            if (this.autoRefresh) {
+                this.startEventSource();
+            } else {
+                if (this.eventSource) {
+                    this.eventSource.close();
+                    this.eventSource = null;
+                }
+            }
+        },
+
+        handleScroll() {
+            const container = this.$refs.logsContainer;
+            const threshold = 50;
+            this.isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < threshold;
+            if (this.isAtBottom) {
+                this.hasNewLogs = false;
+            }
+        },
+
+        scrollToBottom() {
+            const container = this.$refs.logsContainer;
+            container.scrollTop = container.scrollHeight;
+            this.hasNewLogs = false;
+            this.isAtBottom = true;
+        },
+
+        clearLogs() {
+            this.logs = [];
+        },
+
+        debouncedSearch() {
+            clearTimeout(this.searchTimeout);
+            this.searchTimeout = setTimeout(() => {
+                this.loadLogs();
+            }, 300);
+        },
+
+        formatTime(timestamp) {
+            if (!timestamp) return '';
+            const date = new Date(timestamp);
+            return date.toLocaleTimeString('zh-CN', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        },
+
+        formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+    }
+}
+</script>
+{% endblock %}

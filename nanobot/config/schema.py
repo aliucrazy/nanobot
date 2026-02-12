@@ -133,9 +133,11 @@ class AgentsConfig(BaseModel):
 
 class ProviderConfig(BaseModel):
     """LLM provider configuration."""
+    model_config = {"populate_by_name": True}
+
     api_key: str = ""
     api_base: str | None = None
-    extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    extra_headers: dict[str, str] | None = Field(default=None, alias="extra_headers")  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
 class ProvidersConfig(BaseModel):
@@ -243,6 +245,10 @@ class Config(BaseSettings):
                 return spec.default_api_base
         return None
     
-    class Config:
-        env_prefix = "NANOBOT_"
-        env_nested_delimiter = "__"
+    # Pydantic Settings v2: disable auto alias generation to preserve underscore keys like User-Agent
+    model_config = {
+        "env_prefix": "NANOBOT_",
+        "env_nested_delimiter": "__",
+        "populate_by_name": True,
+        "alias_generator": None,
+    }

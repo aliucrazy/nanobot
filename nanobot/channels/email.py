@@ -3,15 +3,20 @@
 import asyncio
 import html
 import imaplib
+import mimetypes
 import re
 import smtplib
 import ssl
 from datetime import date
-from email import policy
+from email import encoders, policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.utils import parseaddr
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -133,12 +138,77 @@ class EmailChannel(BaseChannel):
         email_msg["From"] = self.config.from_address or self.config.smtp_username or self.config.imap_username
         email_msg["To"] = to_addr
         email_msg["Subject"] = subject
-        email_msg.set_content(msg.content or "")
 
         in_reply_to = self._last_message_id_by_chat.get(to_addr)
         if in_reply_to:
             email_msg["In-Reply-To"] = in_reply_to
             email_msg["References"] = in_reply_to
+
+        # Handle attachments
+        attachments = (msg.metadata or {}).get("attachments", [])
+        if attachments or msg.media:
+            # Create multipart message for attachments
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.text import MIMEText
+            from email.mime.base import MIMEBase
+            from email import encoders
+            import mimetypes
+
+            multipart_msg = MIMEMultipart("mixed")
+            multipart_msg["From"] = email_msg["From"]
+            multipart_msg["To"] = email_msg["To"]
+            multipart_msg["Subject"] = email_msg["Subject"]
+            if in_reply_to:
+                multipart_msg["In-Reply-To"] = in_reply_to
+                multipart_msg["References"] = in_reply_to
+
+            # Add text content
+            text_part = MIMEText(msg.content or "", "plain", "utf-8")
+            multipart_msg.attach(text_part)
+
+            # Add attachments from metadata
+            for att in attachments:
+                filename = att.get("filename", "unnamed")
+                content = att.get("content", b"")
+                content_type = att.get("content_type", "application/octet-stream")
+
+                if not content:
+                    continue
+
+                maintype, subtype = content_type.split("/", 1) if "/" in content_type else ("application", "octet-stream")
+                mime_part = MIMEBase(maintype, subtype)
+                mime_part.set_payload(content)
+                encoders.encode_base64(mime_part)
+                mime_part.add_header("Content-Disposition", f"attachment; filename=\"{filename}\"")
+                multipart_msg.attach(mime_part)
+
+            # Add attachments from media (file paths)
+            for media_path in msg.media:
+                try:
+                    from pathlib import Path
+                    path = Path(media_path)
+                    if not path.exists():
+                        logger.warning(f"Attachment not found: {media_path}")
+                        continue
+
+                    content = path.read_bytes()
+                    filename = path.name
+                    content_type, _ = mimetypes.guess_type(str(path))
+                    if not content_type:
+                        content_type = "application/octet-stream"
+
+                    maintype, subtype = content_type.split("/", 1) if "/" in content_type else ("application", "octet-stream")
+                    mime_part = MIMEBase(maintype, subtype)
+                    mime_part.set_payload(content)
+                    encoders.encode_base64(mime_part)
+                    mime_part.add_header("Content-Disposition", f"attachment; filename=\"{filename}\"")
+                    multipart_msg.attach(mime_part)
+                except Exception as e:
+                    logger.error(f"Error attaching file {media_path}: {e}")
+
+            email_msg = multipart_msg
+        else:
+            email_msg.set_content(msg.content or "")
 
         try:
             await asyncio.to_thread(self._smtp_send, email_msg)
@@ -270,6 +340,7 @@ class EmailChannel(BaseChannel):
                 date_value = parsed.get("Date", "")
                 message_id = parsed.get("Message-ID", "").strip()
                 body = self._extract_text_body(parsed)
+                attachments = self._extract_attachments(parsed)
 
                 if not body:
                     body = "(empty email body)"
@@ -283,12 +354,35 @@ class EmailChannel(BaseChannel):
                     f"{body}"
                 )
 
+                # Add attachment info to content
+                if attachments:
+                    content += "\n\n---\nAttachments:\n"
+                    for i, att in enumerate(attachments, 1):
+                        content += f"\n[{i}] {att['filename']} ({att['content_type']}, {att['size']} bytes)"
+                        if 'error' in att:
+                            content += f" [ERROR: {att['error']}]"
+                        elif 'text_preview' in att:
+                            preview = att['text_preview'][:500]  # Limit preview
+                            content += f"\nPreview:\n```\n{preview}\n```"
+                        elif 'text_content' in att:
+                            content += " [text content available]"
+                        else:
+                            content += " [binary attachment]"
+
+                    # For text attachments, also include full content
+                    text_attachments = [att for att in attachments if 'text_content' in att]
+                    if text_attachments:
+                        content += "\n\n---\nText Attachment Contents:\n"
+                        for att in text_attachments:
+                            content += f"\n### {att['filename']} ###\n```\n{att['text_content'][:10000]}\n```\n"
+
                 metadata = {
                     "message_id": message_id,
                     "subject": subject,
                     "date": date_value,
                     "sender_email": sender,
                     "uid": uid,
+                    "attachments": attachments,
                 }
                 messages.append(
                     {
@@ -387,6 +481,77 @@ class EmailChannel(BaseChannel):
         if msg.get_content_type() == "text/html":
             return cls._html_to_text(payload).strip()
         return payload.strip()
+
+    @classmethod
+    def _extract_attachments(cls, msg: Any, max_size_mb: int = 10) -> list[dict[str, Any]]:
+        """Extract attachments from email message.
+
+        Returns list of attachment dicts with:
+        - filename: attachment filename
+        - content_type: MIME type
+        - size: size in bytes
+        - content: decoded bytes content (for binary) or text (for text files)
+        - text_preview: first few lines for text files
+        """
+        attachments: list[dict[str, Any]] = []
+        max_size = max_size_mb * 1024 * 1024
+
+        if not msg.is_multipart():
+            return attachments
+
+        for part in msg.walk():
+            if part.get_content_disposition() != "attachment":
+                continue
+
+            filename = part.get_filename() or "unnamed"
+            content_type = part.get_content_type()
+
+            try:
+                payload_bytes = part.get_payload(decode=True) or b""
+                size = len(payload_bytes)
+
+                if size > max_size:
+                    attachments.append({
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": size,
+                        "error": f"Attachment too large ({size / 1024 / 1024:.1f}MB > {max_size_mb}MB limit)",
+                    })
+                    continue
+
+                attachment = {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size": size,
+                }
+
+                # For text files, also provide text content
+                if content_type.startswith(("text/", "application/json", "application/xml")) or \
+                   filename.endswith((".txt", ".md", ".json", ".xml", ".csv", ".py", ".js", ".ts", ".html", ".css", ".yaml", ".yml", ".sh", ".bash")):
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        text_content = payload_bytes.decode(charset, errors="replace")
+                        attachment["text_content"] = text_content[:50000]  # Limit to 50KB text
+                        # Add preview (first 50 lines)
+                        lines = text_content.split("\n")[:50]
+                        attachment["text_preview"] = "\n".join(lines)
+                    except Exception:
+                        attachment["content"] = payload_bytes
+                else:
+                    # Binary content - don't include bytes in message, just metadata
+                    attachment["content"] = payload_bytes
+
+                attachments.append(attachment)
+
+            except Exception as e:
+                logger.warning(f"Failed to extract attachment {filename}: {e}")
+                attachments.append({
+                    "filename": filename,
+                    "content_type": content_type,
+                    "error": str(e),
+                })
+
+        return attachments
 
     @staticmethod
     def _html_to_text(raw_html: str) -> str:

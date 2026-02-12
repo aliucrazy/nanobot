@@ -4,12 +4,14 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
+from nanobot.hooks import HookRegistry, Context as HookContext
 
 
 def _now_ms() -> int:
@@ -41,14 +43,16 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
 
 class CronService:
     """Service for managing and executing scheduled jobs."""
-    
+
     def __init__(
         self,
         store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None
+        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        hook_context: HookContext | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
+        self.hook_context = hook_context  # Context for scheduled hooks
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
@@ -197,19 +201,35 @@ class CronService:
         self._timer_task = asyncio.create_task(tick())
     
     async def _on_timer(self) -> None:
-        """Handle timer tick - run due jobs."""
+        """Handle timer tick - run due jobs and trigger scheduled hooks."""
         if not self._store:
             return
-        
+
         now = _now_ms()
+        now_dt = datetime.now()
+        current_time = now_dt.strftime("%H:%M")
+
+        # Trigger scheduled hooks (fire-and-forget)
+        if self.hook_context:
+            async def _trigger_scheduled():
+                try:
+                    await HookRegistry.trigger(
+                        "scheduled",
+                        self.hook_context,
+                        current_time,
+                    )
+                except Exception as e:
+                    logger.debug(f"Scheduled hook trigger error (non-critical): {e}")
+            asyncio.create_task(_trigger_scheduled())
+
         due_jobs = [
             j for j in self._store.jobs
             if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
         ]
-        
+
         for job in due_jobs:
             await self._execute_job(job)
-        
+
         self._save_store()
         self._arm_timer()
     
@@ -217,16 +237,19 @@ class CronService:
         """Execute a single job."""
         start_ms = _now_ms()
         logger.info(f"Cron: executing job '{job.name}' ({job.id})")
-        
+
         try:
             response = None
+
             if self.on_job:
                 response = await self.on_job(job)
-            
-            job.state.last_status = "ok"
-            job.state.last_error = None
-            logger.info(f"Cron: job '{job.name}' completed")
-            
+                job.state.last_status = "ok"
+                job.state.last_error = None
+                logger.info(f"Cron: job '{job.name}' completed")
+            else:
+                job.state.last_status = "skipped"
+                logger.warning(f"Cron: job '{job.name}' skipped (no handler)")
+
         except Exception as e:
             job.state.last_status = "error"
             job.state.last_error = str(e)

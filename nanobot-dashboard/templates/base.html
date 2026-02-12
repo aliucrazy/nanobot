@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Nanobot Dashboard{% endblock %}</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <div class="layout">
+        <aside class="sidebar">
+            <div class="logo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="18" height="18" rx="2"/>
+                    <path d="M9 12h6M12 9v6"/>
+                </svg>
+                <span>Nanobot</span>
+            </div>
+            <nav class="nav">
+                <a href="/" class="nav-item {% if request.url.path == '/' %}active{% endif %}">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="7" height="7"/>
+                        <rect x="14" y="3" width="7" height="7"/>
+                        <rect x="14" y="14" width="7" height="7"/>
+                        <rect x="3" y="14" width="7" height="7"/>
+                    </svg>
+                    <span>仪表板</span>
+                </a>
+                <a href="/skills" class="nav-item {% if request.url.path == '/skills' %}active{% endif %}">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                    </svg>
+                    <span>技能管理</span>
+                </a>
+                <a href="/schedules" class="nav-item {% if request.url.path == '/schedules' %}active{% endif %}">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <path d="M12 6v6l4 2"/>
+                    </svg>
+                    <span>调度任务</span>
+                </a>
+                <a href="/logs" class="nav-item {% if request.url.path == '/logs' %}active{% endif %}">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <line x1="16" y1="13" x2="8" y2="13"/>
+                        <line x1="16" y1="17" x2="8" y2="17"/>
+                        <polyline points="10 9 9 9 8 9"/>
+                    </svg>
+                    <span>实时日志</span>
+                </a>
+            </nav>
+        </aside>
+        <main class="main">
+            <header class="header">
+                <h1>{% block header %}Dashboard{% endblock %}</h1>
+                <div class="header-actions">
+                    <span class="status-indicator" id="connection-status">
+                        <span class="status-dot online"></span>
+                        在线
+                    </span>
+                </div>
+            </header>
+            <div class="content">
+                {% block content %}{% endblock %}
+            </div>
+        </main>
+    </div>
+    <script>
+        // Update connection status
+        setInterval(() => {
+            fetch('/api/stats')
+                .then(r => r.ok ? r.json() : Promise.reject())
+                .then(() => {
+                    document.getElementById('connection-status').innerHTML =
+                        '<span class="status-dot online"></span>在线';
+                })
+                .catch(() => {
+                    document.getElementById('connection-status').innerHTML =
+                        '<span class="status-dot offline"></span>离线';
+                });
+        }, 30000);
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -141,8 +141,15 @@ class LiteLLMProvider(LLMProvider):
             kwargs["api_base"] = self.api_base
         
         # Pass extra headers (e.g. APP-Code for AiHubMix)
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
+        extra_headers = dict(self.extra_headers) if self.extra_headers else {}
+
+        # Auto-add Kimi CLI headers for kimi.com endpoints
+        if self.api_base and "kimi.com" in self.api_base:
+            extra_headers.setdefault("User-Agent", "claude-code/0.1.0")
+            extra_headers.setdefault("X-Client-Name", "claude-code")
+
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
         
         if tools:
             kwargs["tools"] = tools

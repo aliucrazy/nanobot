@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+
+{% block title %}技能管理 - Nanobot Dashboard{% endblock %}
+{% block header %}技能管理{% endblock %}
+
+{% block content %}
+<div class="skills-page" x-data="skillsManager()" x-init="loadSkills()">
+    <!-- Filter Bar -->
+    <div class="filter-bar">
+        <div class="search-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"/>
+                <path d="m21 21-4.35-4.35"/>
+            </svg>
+            <input type="text" x-model="search" placeholder="搜索技能..." @input="filterSkills()">
+        </div>
+        <div class="filter-tabs">
+            <button class="tab-btn" :class="{active: filter === 'all'}" @click="filter = 'all'; filterSkills()">全部</button>
+            <button class="tab-btn" :class="{active: filter === 'enabled'}" @click="filter = 'enabled'; filterSkills()">已启用</button>
+            <button class="tab-btn" :class="{active: filter === 'disabled'}" @click="filter = 'disabled'; filterSkills()">已禁用</button>
+        </div>
+    </div>
+
+    <!-- Skills Grid -->
+    <div class="skills-grid" x-show="!loading">
+        <template x-for="skill in filteredSkills" :key="skill.id">
+            <div class="skill-card" :class="{disabled: !skill.enabled, unavailable: !skill.available}">
+                <div class="skill-header">
+                    <h3 x-text="skill.name"></h3>
+                    <div class="skill-badges">
+                        <span class="badge badge-info" x-show="skill.has_hooks">Hook</span>
+                        <span class="badge badge-warning" x-show="!skill.available">不可用</span>
+                    </div>
+                </div>
+                <p class="skill-description" x-text="skill.description || '暂无描述'"></p>
+                <div class="skill-meta">
+                    <span class="trigger-tag" x-show="skill.triggers && skill.triggers.length > 0" x-text="skill.triggers[0]"></span>
+                    <span class="trigger-tag" x-show="!skill.triggers || skill.triggers.length === 0">手动触发</span>
+                </div>
+                <div class="skill-actions">
+                    <button class="btn btn-sm" :class="skill.enabled ? 'btn-secondary' : 'btn-primary'" @click="toggleSkill(skill)">
+                        <span x-text="skill.enabled ? '禁用' : '启用'"></span>
+                    </button>
+                    <button class="btn btn-sm btn-primary" @click="triggerSkill(skill)" :disabled="!skill.enabled || !skill.available">
+                        触发
+                    </button>
+                    <button class="btn btn-sm btn-ghost" @click="showDetail(skill)">
+                        详情
+                    </button>
+                </div>
+            </div>
+        </template>
+    </div>
+
+    <!-- Loading State -->
+    <div class="loading-state" x-show="loading">
+        <div class="spinner"></div>
+        <p>加载中...</p>
+    </div>
+
+    <!-- Empty State -->
+    <div class="empty-state-full" x-show="!loading && filteredSkills.length === 0">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+        </svg>
+        <p>没有找到匹配的技能</p>
+    </div>
+
+    <!-- Skill Detail Modal -->
+    <div class="modal" x-show="detailModal.open" x-cloak @click.self="detailModal.open = false">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 x-text="detailModal.skill?.name"></h2>
+                <button class="btn-close" @click="detailModal.open = false">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="detail-section">
+                    <h4>描述</h4>
+                    <p x-text="detailModal.skill?.description || '暂无描述'"></p>
+                </div>
+                <div class="detail-section" x-show="detailModal.skill?.triggers?.length > 0">
+                    <h4>触发方式</h4>
+                    <ul>
+                        <template x-for="trigger in detailModal.skill?.triggers" :key="trigger">
+                            <li x-text="trigger"></li>
+                        </template>
+                    </ul>
+                </div>
+                <div class="detail-section" x-show="detailModal.skill?.missing_requirements?.length > 0">
+                    <h4>缺失依赖</h4>
+                    <ul class="error-list">
+                        <template x-for="req in detailModal.skill?.missing_requirements" :key="req">
+                            <li x-text="req"></li>
+                        </template>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast" x-show="toast.show" x-transition @click="toast.show = false">
+        <span :class="toast.type" x-text="toast.message"></span>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function skillsManager() {
+    return {
+        skills: [],
+        filteredSkills: [],
+        loading: true,
+        search: '',
+        filter: 'all',
+        detailModal: {
+            open: false,
+            skill: null
+        },
+        toast: {
+            show: false,
+            message: '',
+            type: 'success'
+        },
+
+        async loadSkills() {
+            this.loading = true;
+            try {
+                const response = await fetch('/api/skills');
+                const data = await response.json();
+                this.skills = data.skills;
+                this.filterSkills();
+            } catch (error) {
+                this.showToast('加载技能失败', 'error');
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        filterSkills() {
+            let result = this.skills;
+
+            // Apply search filter
+            if (this.search) {
+                const term = this.search.toLowerCase();
+                result = result.filter(s =>
+                    s.name.toLowerCase().includes(term) ||
+                    (s.description && s.description.toLowerCase().includes(term))
+                );
+            }
+
+            // Apply status filter
+            if (this.filter === 'enabled') {
+                result = result.filter(s => s.enabled);
+            } else if (this.filter === 'disabled') {
+                result = result.filter(s => !s.enabled);
+            }
+
+            this.filteredSkills = result;
+        },
+
+        async toggleSkill(skill) {
+            try {
+                const response = await fetch(`/api/skills/${skill.id}/toggle`, {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    skill.enabled = data.enabled;
+                    this.showToast(`技能已${data.enabled ? '启用' : '禁用'}`, 'success');
+                } else {
+                    throw new Error('Toggle failed');
+                }
+            } catch (error) {
+                this.showToast('操作失败', 'error');
+            }
+        },
+
+        async triggerSkill(skill) {
+            try {
+                const response = await fetch(`/api/skills/${skill.id}/trigger`, {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.triggered) {
+                        this.showToast('技能已触发', 'success');
+                    } else {
+                        this.showToast(data.message || '无法触发', 'warning');
+                    }
+                } else {
+                    throw new Error('Trigger failed');
+                }
+            } catch (error) {
+                this.showToast('触发失败', 'error');
+            }
+        },
+
+        showDetail(skill) {
+            this.detailModal.skill = skill;
+            this.detailModal.open = true;
+        },
+
+        showToast(message, type = 'success') {
+            this.toast.message = message;
+            this.toast.type = type;
+            this.toast.show = true;
+            setTimeout(() => {
+                this.toast.show = false;
+            }, 3000);
+        }
+    }
+}
+</script>
+{% endblock %}

@@ -26,10 +26,8 @@ from nanobot.agent.tools.firecrawl import (
     FirecrawlExtractTool,
 )
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.reflection import ReflectionEngine
-from nanobot.agent.user_profiler import UserProfiler
-from nanobot.agent.skill_analytics import SkillAnalytics
 from nanobot.session.manager import SessionManager
+from nanobot.hooks import HookRegistry, SkillLoader, Context as HookContext
 
 
 class AgentLoop:
@@ -72,8 +70,6 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
-        self.reflection = ReflectionEngine(workspace, provider, self.model)
-        self.profiler = UserProfiler(workspace)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -86,6 +82,26 @@ class AgentLoop:
         
         self._running = False
         self._register_default_tools()
+
+        # Load skill hooks (non-intrusive extension mechanism)
+        # Skills are stored in ~/.nanobot/skills/, not workspace/skills/
+        from nanobot.config.loader import get_config_path
+        skills_dir = get_config_path().parent / "skills"
+        self._skill_loader = SkillLoader(skills_dir)
+        self._hook_context = HookContext(
+            workspace=self.workspace,
+            provider=self.provider,
+            model=self.model,
+            memory=self.context.memory,
+        )
+
+        # Sync load skills on init
+        try:
+            skill_count = self._skill_loader.load_all()
+            if skill_count > 0:
+                logger.info(f"Loaded {skill_count} skill(s) with hooks")
+        except Exception as e:
+            logger.warning(f"Failed to load skills: {e}")
     
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -176,17 +192,23 @@ class AgentLoop:
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
-        
+
+        # Trigger message_received hook (fire-and-forget)
+        async def _trigger_message_received():
+            try:
+                await HookRegistry.trigger(
+                    "message_received",
+                    self._hook_context,
+                    msg.channel,
+                    msg.sender_id,
+                    msg.content[:200],  # Preview only
+                )
+            except Exception as e:
+                logger.debug(f"message_received hook error (non-critical): {e}")
+        asyncio.create_task(_trigger_message_received())
+
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
-
-        # Extract and update user profile
-        profile = self.profiler.extract_profile(msg)
-        self.profiler.update_profile(profile, msg)
-
-        # Get adaptation hints for context
-        adaptation_hints = self.profiler.get_adaptation_hints(msg.sender_id, msg.channel)
-        logger.debug(f"User profile hints: {adaptation_hints}")
 
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
@@ -250,7 +272,9 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -271,10 +295,22 @@ class AgentLoop:
         session.add_message("assistant", final_content)
         self.sessions.save(session)
 
-        # Trigger post-conversation reflection (non-blocking)
-        asyncio.create_task(
-            self._trigger_reflection(session.messages, msg.session_key)
-        )
+        # Trigger after_conversation hook (non-blocking, fire-and-forget)
+        # Create a snapshot of messages to avoid race conditions
+        messages_snapshot = list(session.messages)
+
+        async def _trigger_hooks():
+            try:
+                await HookRegistry.trigger(
+                    "after_conversation",
+                    self._hook_context,
+                    messages_snapshot,
+                    msg.session_key,
+                )
+            except Exception as e:
+                logger.debug(f"Hook trigger error (non-critical): {e}")
+
+        asyncio.create_task(_trigger_hooks())
 
         return OutboundMessage(
             channel=msg.channel,
@@ -283,24 +319,6 @@ class AgentLoop:
             metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
         )
 
-    async def _trigger_reflection(
-        self,
-        messages: list[dict[str, Any]],
-        session_key: str,
-    ) -> None:
-        """
-        Trigger reflection after conversation (fire-and-forget).
-
-        Args:
-            messages: The conversation messages.
-            session_key: Session identifier.
-        """
-        try:
-            await self.reflection.reflect_after_conversation(messages, session_key)
-        except Exception as e:
-            # Reflection failures should not affect the main flow
-            logger.debug(f"Reflection error (non-critical): {e}")
-    
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -378,17 +396,35 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+
+                    # Track execution time and record analytics
+                    start_time = time.time()
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    duration_ms = (time.time() - start_time) * 1000
+
+                    # Record success/failure for analytics
+                    success = not result.startswith("Error:")
+                    error_type = None
+                    if not success and ":" in result:
+                        error_type = result.split(":")[1].strip().split()[0]
+                    self.analytics.record_skill_usage(
+                        skill_name=tool_call.name,
+                        success=success,
+                        duration_ms=duration_ms,
+                        error_type=error_type,
+                        context={"args_preview": args_str[:100], "source": "system"},
+                    )
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
                 final_content = response.content
                 break
-        
+
         if final_content is None:
             final_content = "Background task completed."
-        
+
         # Save to session (mark as system message in history)
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
